@@ -45,7 +45,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
 
-from memory_service import build_memory_prompt, load_context, save_exchange
+from memory_service import build_memory_prompt, load_context, save_exchange, get_redis
 from ocr_service import extract_text_from_images
 from tools import (
     delete_trip,
@@ -70,20 +70,6 @@ logging.basicConfig(
 logger = logging.getLogger("agent")
 
 app = FastAPI()
-
-# ── Diagnostic au démarrage : affiche le schéma réel de save_trip ─────────────
-
-@app.on_event("startup")
-async def _startup_diagnostics():
-    try:
-        schema = save_trip.args_schema.schema()
-        import json as _json
-        print("\n" + "═"*60)
-        print("🔍 DIAGNOSTIC save_trip — paramètres attendus :")
-        print(_json.dumps(schema, indent=2, ensure_ascii=False))
-        print("═"*60 + "\n")
-    except Exception as e:
-        print(f"⚠️  Impossible de lire le schéma save_trip : {e}")
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
@@ -376,17 +362,48 @@ async def agent_endpoint(payload: Payload):
         if images_bytes:
             nb = len(images_bytes)
 
-            # ── 0) Extraction prix par LLM — UNE seule fois ───────────────────
-            # Priorité : valeurs JSON explicites > extraction depuis message
+            # ── 0) Extraction prix — UNE seule fois, mis en cache Redis 5min ──
+            # WhatsApp envoie chaque image dans un webhook séparé.
+            # La 1ère image arrive avec le message (et les prix).
+            # Les suivantes arrivent avec msg='' → on récupère les prix du cache.
+
             prix_camion = payload.prix_camion
             prix_client = payload.prix_client
 
-            if prix_camion is None or prix_client is None:
-                extracted_prices = _llm_extract_prices(payload.message or "")
-                prix_camion = prix_camion or extracted_prices.get("prix_camion")
-                prix_client = prix_client or extracted_prices.get("prix_client")
+            _key_prix = f"prix:{user_id}"
 
-            # Si encore manquant → demander UNE SEULE FOIS (indépendant du nb d images)
+            if prix_camion is None or prix_client is None:
+                # Essai 1 : extraction LLM depuis le message
+                extracted = _llm_extract_prices(payload.message or "")
+                prix_camion = prix_camion or extracted.get("prix_camion")
+                prix_client = prix_client or extracted.get("prix_client")
+
+            if prix_camion is not None and prix_client is not None:
+                # Sauvegarde dans Redis — TTL 5 minutes (groupe WhatsApp)
+                try:
+                    r = get_redis()
+                    r.setex(_key_prix, 300, json.dumps({
+                        "prix_camion": prix_camion,
+                        "prix_client": prix_client,
+                    }))
+                    logger.info("💾 Prix mis en cache Redis [%s] : %s/%s", user_id, prix_camion, prix_client)
+                except Exception as e:
+                    logger.warning("Cache prix Redis échoué : %s", e)
+            else:
+                # Essai 2 : récupération depuis le cache Redis
+                try:
+                    r      = get_redis()
+                    cached = r.get(_key_prix)
+                    if cached:
+                        data        = json.loads(cached)
+                        prix_camion = prix_camion or data.get("prix_camion")
+                        prix_client = prix_client or data.get("prix_client")
+                        logger.info("♻️  Prix récupérés du cache Redis [%s] : %s/%s",
+                                    user_id, prix_camion, prix_client)
+                except Exception as e:
+                    logger.warning("Lecture cache prix Redis échouée : %s", e)
+
+            # Si toujours manquant → demander UNE SEULE FOIS
             missing = []
             if prix_camion is None:
                 missing.append("💰 *prix camion* (payé au transporteur par tonne)")
@@ -394,17 +411,18 @@ async def agent_endpoint(payload: Payload):
                 missing.append("💵 *prix client* (facturé à l'entreprise par tonne)")
 
             if missing:
-                logger.warning("[%s] Prix manquants après extraction LLM", user_id)
+                logger.warning("[%s] Prix manquants après extraction LLM + cache", user_id)
                 return {
                     "reply": (
                         "⚠️ *Prix manquants — merci de préciser :*\n\n" +
                         "\n".join(f"  • {m}" for m in missing) +
                         "\n\nExemple : _5000 7000_ ou _camion 5000 client 7000_\n"
-                        "Renvoyez vos images avec ces prix."
+                        "Puis renvoyez vos images."
                     )
                 }
 
-            logger.info("💲 [%s] prix_camion=%.0f  prix_client=%.0f", user_id, prix_camion, prix_client)
+            logger.info("💲 [%s] prix_camion=%.0f  prix_client=%.0f",
+                        user_id, prix_camion, prix_client)
 
             # ── 1) ACK immédiat ───────────────────────────────────────────────
             ack_message = (
@@ -498,38 +516,19 @@ async def agent_endpoint(payload: Payload):
                     continue
 
                 try:
-                    # ── Préparation save_kwargs ───────────────────────────────
-                    # DIAGNOSTIC : on inspecte le schéma réel au 1er appel
-                    # pour trouver le bon nom du champ immatriculation
-                    try:
-                        _schema     = save_trip.args_schema.schema()
-                        _props      = _schema.get("properties", {})
-                        _req        = _schema.get("required", [])
-                        # Cherche le champ qui ressemble à "camion" / "num_camion" / "immat"
-                        _immat_key  = next(
-                            (k for k in _props
-                             if any(x in k.lower() for x in ["camion", "immat", "num", "vehic", "truck"])),
-                            None,
-                        )
-                        print(f"\n🔍 save_trip properties : {list(_props.keys())}")
-                        print(f"🔍 save_trip required   : {_req}")
-                        print(f"🔍 champ immat détecté  : {_immat_key}\n")
-                    except Exception as _e:
-                        print(f"⚠️  Diagnostic schéma échoué : {_e}")
-                        _immat_key = "num_camion"   # fallback conservateur
-
+                    # Champs exacts selon le schéma Pydantic de save_trip :
+                    # required: num_camion, tonnage, entreprise, prix_camion, prix_client
+                    # optionnel: unite (default="tonne")
                     save_kwargs: dict[str, Any] = {
+                        "num_camion":  immat or "INCONNU",
                         "entreprise":  entreprise,
                         "tonnage":     tonnage_kg,
                         "unite":       "kg",
                         "prix_camion": prix_camion,
                         "prix_client": prix_client,
                     }
-                    # Ajout immatriculation avec le bon nom de champ
-                    if immat and _immat_key:
-                        save_kwargs[_immat_key] = immat
 
-                    print(f"📤 save_trip invoke #{idx+1} → {save_kwargs}")
+                    print(f"📤 save_trip #{idx+1} → {save_kwargs}")
                     save_trip.invoke(save_kwargs)
                     entry["saved"] = True
                     logger.info("💾 #%d — %s / %s / %.0f kg", idx + 1, immat, entreprise, tonnage_kg)
