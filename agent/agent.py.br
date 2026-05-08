@@ -1,0 +1,239 @@
+import os
+import json
+import time
+import redis
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Optional, List
+
+from openai import OpenAI, RateLimitError, APITimeoutError
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+from datetime import date
+
+# =========================
+# ENV
+# =========================
+load_dotenv()
+
+app = FastAPI()
+
+# =========================
+# REDIS
+# =========================
+r = redis.Redis(
+    host="localhost",
+    port=6379,
+    decode_responses=True
+)
+
+# =========================
+# OPENAI CLIENT (RAW)
+# =========================
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# =========================
+# LANGCHAIN LLM (for agent/tools)
+# =========================
+llm = ChatOpenAI(
+    model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    temperature=0,
+)
+
+memory = MemorySaver()
+
+# tools = [...]
+tools = []
+
+graph = create_react_agent(llm, tools, checkpointer=memory)
+
+# =========================
+# SYSTEM PROMPT
+# =========================
+SYSTEM_PROMPT = f"""
+Tu es un assistant de gestion de transport de marchandises.
+
+Date: {date.today().strftime('%d/%m/%Y')}
+
+Règles:
+- extraction reçus
+- tonnage en KG
+- gestion voyages
+- génération PDF
+- réponses courtes WhatsApp
+"""
+
+# =========================
+# REQUEST MODEL
+# =========================
+class Payload(BaseModel):
+    message: Optional[str] = ""
+    user: Optional[str] = ""
+    image: Optional[str] = None
+
+# =========================
+# REDIS MEMORY (LAST 10 MSG)
+# =========================
+def get_last_messages(user_id: str) -> List[dict]:
+    data = r.get(f"user:{user_id}:msgs")
+    return json.loads(data) if data else []
+
+def save_message(user_id: str, role: str, content: str):
+    key = f"user:{user_id}:msgs"
+
+    msgs = get_last_messages(user_id)
+    msgs.append({"role": role, "content": content})
+
+    msgs = msgs[-10:]  # keep only last 10
+
+    r.set(key, json.dumps(msgs), ex=3600)
+
+# =========================
+# SUMMARY MEMORY
+# =========================
+def get_summary(user_id: str) -> str:
+    return r.get(f"user:{user_id}:summary") or ""
+
+def update_summary(user_id: str, summary: str):
+    r.set(f"user:{user_id}:summary", summary)
+
+def build_summary(user_id: str):
+    msgs = get_last_messages(user_id)
+
+    prompt = f"""
+Résume cette conversation pour un assistant transport:
+
+{msgs}
+
+Résumé utile:
+"""
+
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            timeout=20
+        )
+
+        summary = res.choices[0].message.content
+        update_summary(user_id, summary)
+
+    except Exception as e:
+        print("summary error:", e)
+
+# =========================
+# OPENAI ROBUST WRAPPER
+# =========================
+def call_openai(messages, max_retries=5):
+    delay = 2
+
+    for _ in range(max_retries):
+        try:
+            res = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                timeout=30
+            )
+            return res.choices[0].message.content
+
+        except RateLimitError:
+            print("Rate limit, retry...")
+            time.sleep(delay)
+            delay *= 2
+
+        except APITimeoutError:
+            print("Timeout, retry...")
+            time.sleep(delay)
+            delay *= 2
+
+        except Exception as e:
+            print("OpenAI error:", e)
+            time.sleep(delay)
+            delay *= 2
+
+    return "❌ OpenAI indisponible"
+
+# =========================
+# CONTEXT BUILDER
+# =========================
+def build_context(user_id: str, new_message: str):
+
+    summary = get_summary(user_id)
+    history = get_last_messages(user_id)
+
+    return [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT + "\n\nSUMMARY:\n" + summary
+        },
+        *history,
+        {
+            "role": "user",
+            "content": new_message
+        }
+    ]
+
+# =========================
+# MAIN PROCESS
+# =========================
+def process_message(user_id: str, message: str):
+
+    # 1. save user message
+    save_message(user_id, "user", message)
+
+    # 2. build context
+    context = build_context(user_id, message)
+
+    # 3. call openai safely
+    reply = call_openai(context)
+
+    # 4. save assistant reply
+    save_message(user_id, "assistant", reply)
+
+    # 5. periodic summary
+    if len(get_last_messages(user_id)) % 5 == 0:
+        build_summary(user_id)
+
+    return reply
+
+# =========================
+# FASTAPI ENDPOINT
+# =========================
+@app.post("/agent")
+async def agent(payload: Payload):
+
+    user_id = payload.user or "default"
+
+    print(f"📩 [{user_id}] {payload.message}")
+
+    try:
+        # IMAGE HANDLING (optional)
+        if payload.image:
+            message = payload.message or ""
+            message += "\n[image received]"
+
+        else:
+            message = payload.message or ""
+
+        reply = process_message(user_id, message)
+
+        return {"reply": reply}
+
+    except Exception as e:
+        print("ERROR:", e)
+        return {"reply": "❌ erreur serveur"}
+
+# =========================
+# HEALTH CHECK
+# =========================
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model": os.getenv("LLM_MODEL", "gpt-4o-mini")
+    }
