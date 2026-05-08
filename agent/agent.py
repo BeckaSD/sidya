@@ -847,7 +847,7 @@ async def health():
         "openai_timeout":  OPENAI_TIMEOUT,
         "group_wait_sec":  GROUP_WAIT_SEC,
     }
-
+ 
 
 @app.delete("/memory/{user_id}")
 async def reset_memory(user_id: str):
