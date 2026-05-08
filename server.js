@@ -16,7 +16,10 @@ app.use(express.json())
 
 const CONFIG = {
   PYTHON_URL:      'http://127.0.0.1:8000/agent',
-  TIMEOUT:         30000,
+  POLL_URL:        'http://127.0.0.1:8000/poll',   // ← nouveau endpoint poll
+  TIMEOUT:         12000,    // 12s — juste pour recevoir l ACK (pas le résultat final)
+  POLL_INTERVAL:   3000,     // poll toutes les 3s
+  POLL_MAX_TRIES:  60,       // 60 × 3s = 3 minutes max
   RECONNECT_DELAY: 5000,
   MAX_RECONNECT:   10
 }
@@ -34,6 +37,77 @@ function isAuthorized(jid) {
 
 let sock
 let reconnectCount = 0
+
+// ── Polling actif par userId ──────────────────────────────────────────────────
+// Map userId → { intervalId, tries }
+const activePolls = new Map()
+
+function startPolling(from) {
+  // Évite de démarrer deux polls pour le même utilisateur
+  if (activePolls.has(from)) return
+
+  let tries = 0
+  console.log(`🔄 Poll démarré pour [${from}]`)
+
+  const intervalId = setInterval(async () => {
+    tries++
+
+    // Timeout total dépassé
+    if (tries > CONFIG.POLL_MAX_TRIES) {
+      console.warn(`⏰ [${from}] Poll timeout`)
+      clearInterval(intervalId)
+      activePolls.delete(from)
+      try {
+        await sock.sendMessage(from, { text: '⚠️ Traitement trop long, réessayez.' })
+      } catch (_) {}
+      return
+    }
+
+    try {
+      const res   = await axios.get(
+        `${CONFIG.POLL_URL}/${encodeURIComponent(from)}`,
+        { timeout: 5000 }
+      )
+      const reply    = res.data?.reply
+      const pdfPath  = res.data?.pdf_path
+
+      // Pas encore prêt
+      if (!reply && !pdfPath) return
+
+      // Réponse prête → stop poll
+      clearInterval(intervalId)
+      activePolls.delete(from)
+      console.log(`✅ [${from}] Réponse reçue après ${tries} poll(s)`)
+
+      // ── CAS PDF ────────────────────────────────────────────────────────────
+      if (pdfPath) {
+        const pdfBuffer = fs.readFileSync(pdfPath)
+        const pdfName   = path.basename(pdfPath)
+        await sock.sendMessage(from, { text: reply || '📄 PDF prêt' })
+        await sock.sendMessage(from, {
+          document: pdfBuffer,
+          mimetype: 'application/pdf',
+          fileName: pdfName,
+        })
+        console.log(`📄 PDF envoyé: ${pdfName}`)
+        try { fs.unlinkSync(pdfPath) } catch (_) {}
+        return
+      }
+
+      // ── CAS TEXTE ──────────────────────────────────────────────────────────
+      await sock.sendMessage(from, { text: reply })
+      console.log(`📤 BOT: ${reply.substring(0, 120)}`)
+
+    } catch (err) {
+      // Erreur réseau ponctuelle → on réessaie au prochain cycle
+      console.warn(`⚠️  Poll [${from}] erreur: ${err.message}`)
+    }
+  }, CONFIG.POLL_INTERVAL)
+
+  activePolls.set(from, { intervalId, tries: 0 })
+}
+
+// ── Bot WhatsApp ──────────────────────────────────────────────────────────────
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth_session')
@@ -119,36 +193,50 @@ async function startBot() {
         { timeout: CONFIG.TIMEOUT }
       )
 
-      // ─── CAS PDF ───────────────────────────────────────────────────────────
-      if (data.pdf_path) {
-        const pdfBuffer  = fs.readFileSync(data.pdf_path)
-        const pdfName    = path.basename(data.pdf_path)
+      // ── Réponse immédiate avec résultat complet (mode texte ou 1 image rapide)
+      if (data.reply) {
 
-        // Envoyer message texte d'abord
+        // CAS PDF
+        if (data.pdf_path) {
+          const pdfBuffer = fs.readFileSync(data.pdf_path)
+          const pdfName   = path.basename(data.pdf_path)
+          await sock.sendMessage(from, { text: data.reply })
+          await sock.sendMessage(from, {
+            document: pdfBuffer,
+            mimetype: 'application/pdf',
+            fileName: pdfName,
+          })
+          console.log(`📄 PDF envoye: ${pdfName}`)
+          try { fs.unlinkSync(data.pdf_path) } catch (_) {}
+          return
+        }
+
+        // CAS TEXTE NORMAL
         await sock.sendMessage(from, { text: data.reply })
-
-        // Envoyer le PDF comme document
-        await sock.sendMessage(from, {
-          document:  pdfBuffer,
-          mimetype:  'application/pdf',
-          fileName:  pdfName,
-        })
-        console.log(`📄 PDF envoye: ${pdfName}`)
-
-        // Nettoyer le fichier temporaire
-        fs.unlinkSync(data.pdf_path)
+        console.log(`📤 BOT: ${data.reply.substring(0, 120)}`)
         return
       }
 
-      // ─── CAS TEXTE NORMAL ──────────────────────────────────────────────────
-      const reply = data?.reply
-      if (!reply) return
-      await sock.sendMessage(from, { text: reply })
-      console.log(`📤 BOT: ${reply}`)
+      // ── Traitement async en cours (images groupées) → ACK + polling ─────────
+      if (data.status === 'processing' || data.status === 'queued') {
+
+        // Envoyer l ACK uniquement pour le 1er webhook du groupe
+        if (data.status === 'processing' && data.ack) {
+          await sock.sendMessage(from, { text: data.ack })
+          console.log(`📤 ACK envoyé → [${from}]`)
+        }
+
+        // Démarrer le polling pour récupérer la réponse finale
+        startPolling(from)
+        return
+      }
 
     } catch (err) {
       console.log('❌ ERREUR AGENT:', err.message)
-      await sock.sendMessage(from, { text: '⚠️ Service indisponible, reessayez.' })
+      // Ne pas envoyer d erreur si c est juste un timeout réseau ponctuel
+      if (!err.message.includes('timeout')) {
+        await sock.sendMessage(from, { text: '⚠️ Service indisponible, reessayez.' })
+      }
     }
   })
 }
