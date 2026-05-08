@@ -71,6 +71,20 @@ logger = logging.getLogger("agent")
 
 app = FastAPI()
 
+# ── Diagnostic au démarrage : affiche le schéma réel de save_trip ─────────────
+
+@app.on_event("startup")
+async def _startup_diagnostics():
+    try:
+        schema = save_trip.args_schema.schema()
+        import json as _json
+        print("\n" + "═"*60)
+        print("🔍 DIAGNOSTIC save_trip — paramètres attendus :")
+        print(_json.dumps(schema, indent=2, ensure_ascii=False))
+        print("═"*60 + "\n")
+    except Exception as e:
+        print(f"⚠️  Impossible de lire le schéma save_trip : {e}")
+
 # ── Constantes ────────────────────────────────────────────────────────────────
 
 _OPENAI_API_KEY: str   = os.getenv("OPENAI_API_KEY", "")
@@ -484,6 +498,26 @@ async def agent_endpoint(payload: Payload):
                     continue
 
                 try:
+                    # ── Préparation save_kwargs ───────────────────────────────
+                    # DIAGNOSTIC : on inspecte le schéma réel au 1er appel
+                    # pour trouver le bon nom du champ immatriculation
+                    try:
+                        _schema     = save_trip.args_schema.schema()
+                        _props      = _schema.get("properties", {})
+                        _req        = _schema.get("required", [])
+                        # Cherche le champ qui ressemble à "camion" / "num_camion" / "immat"
+                        _immat_key  = next(
+                            (k for k in _props
+                             if any(x in k.lower() for x in ["camion", "immat", "num", "vehic", "truck"])),
+                            None,
+                        )
+                        print(f"\n🔍 save_trip properties : {list(_props.keys())}")
+                        print(f"🔍 save_trip required   : {_req}")
+                        print(f"🔍 champ immat détecté  : {_immat_key}\n")
+                    except Exception as _e:
+                        print(f"⚠️  Diagnostic schéma échoué : {_e}")
+                        _immat_key = "num_camion"   # fallback conservateur
+
                     save_kwargs: dict[str, Any] = {
                         "entreprise":  entreprise,
                         "tonnage":     tonnage_kg,
@@ -491,16 +525,20 @@ async def agent_endpoint(payload: Payload):
                         "prix_camion": prix_camion,
                         "prix_client": prix_client,
                     }
-                    if immat:
-                        save_kwargs["camion"] = immat
+                    # Ajout immatriculation avec le bon nom de champ
+                    if immat and _immat_key:
+                        save_kwargs[_immat_key] = immat
 
+                    print(f"📤 save_trip invoke #{idx+1} → {save_kwargs}")
                     save_trip.invoke(save_kwargs)
                     entry["saved"] = True
                     logger.info("💾 #%d — %s / %s / %.0f kg", idx + 1, immat, entreprise, tonnage_kg)
+                    print(f"✅ save_trip #{idx+1} OK")
 
                 except Exception as exc:
                     entry["erreur"] = f"Erreur save_trip : {exc}"
                     logger.error("❌ Reçu #%d save_trip : %s", idx + 1, exc)
+                    print(f"❌ save_trip #{idx+1} ERREUR : {exc}")
 
                 results_map[idx] = entry
 

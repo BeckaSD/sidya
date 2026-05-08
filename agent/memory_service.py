@@ -24,21 +24,34 @@ from typing import Any
 
 import httpx
 import redis
+from dotenv import load_dotenv
+
+load_dotenv()   # ← garantit que .env est chargé même si importé avant agent.py
 
 logger = logging.getLogger("memory_service")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-REDIS_HOST:   str = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT:   int = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB:     int = int(os.getenv("REDIS_DB", "0"))
-REDIS_PASS:   str | None = os.getenv("REDIS_PASSWORD", None)
+REDIS_HOST:   str      = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT:   int      = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB:     int      = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASS:   str|None = os.getenv("REDIS_PASSWORD", None)
 
 MAX_MESSAGES: int   = 10      # messages conservés avant compression
 TTL_SECONDS:  int   = 86400   # expiration clés Redis (24h)
 
-_OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-_LLM_MODEL:      str = os.getenv("LLM_MODEL", "gpt-4o")
+_LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
+
+
+def _openai_key() -> str:
+    """Relit la clé à chaque appel — évite le bug 'Bearer ' vide au démarrage."""
+    key = os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        load_dotenv(override=True)
+        key = os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY manquante dans .env")
+    return key
 
 # ── Client Redis (singleton) ──────────────────────────────────────────────────
 
@@ -94,7 +107,7 @@ def _generate_summary(existing_summary: str, messages: list[dict]) -> str:
             resp = client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {_OPENAI_API_KEY}",
+                    "Authorization": f"Bearer {_openai_key()}",
                     "Content-Type":  "application/json",
                 },
                 json={
