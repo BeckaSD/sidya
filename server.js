@@ -66,9 +66,10 @@ function startPolling(from) {
     try {
       const res   = await axios.get(
         `${CONFIG.POLL_URL}/${encodeURIComponent(from)}`,
-        { timeout: 5000 }
+        { timeout: 35000 }
       )
-      const reply    = res.data?.reply
+      const ready = res.data?.ready
+      const reply = res.data?.reply
       const pdfPath  = res.data?.pdf_path
 
       // Pas encore prêt
@@ -95,8 +96,8 @@ function startPolling(from) {
       }
 
       // ── CAS TEXTE ──────────────────────────────────────────────────────────
-      await sock.sendMessage(from, { text: reply })
-      console.log(`📤 BOT: ${reply.substring(0, 120)}`)
+      if(reply) await sock.sendMessage(from, { text: reply })
+      if(reply) console.log(`📤 BOT: ${reply.substring(0, 120)}`)
 
     } catch (err) {
       // Erreur réseau ponctuelle → on réessaie au prochain cycle
