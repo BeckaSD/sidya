@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Environment variables
+!.env.example
+
+# Node.js
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# PM2
+pids/
+*.pid
+
+# Backup files
+backup/
+*.save
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# JetBrains
+.idea/
+
+# Auth / sessions
+auth_session/
+
+# Python cache in subfolders
+**/__pycache__/
+
+# Temporary files
+tmp/
+temp/
