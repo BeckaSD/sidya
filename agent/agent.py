@@ -4,15 +4,18 @@ agent.py
 Agent IA + WhatsApp — gestion transport de marchandises.
 
 PIPELINE MODE IMAGE :
-  0) Validation prix (stop immédiat si manquant)
-  1) ACK WhatsApp  "traitement en cours..."
+  0) LLM extrait prix_camion + prix_client depuis le message texte
+     → flexible : "5000 7000", "سعر الشاحن 5000 سعر الشركة 7000",
+                  "camion=5000 client=7000", deux chiffres seuls, etc.
+     → si manquant → demande UNE SEULE FOIS (pas une fois par image)
+  1) ACK WhatsApp immédiat
   2) OCR multithreading → [{id, ocr_text}]
   3) Nettoyage OCR (tagging immatriculation 🔢)
-  4) Découpage en lots de 5
-  5) Lots → OpenAI en série (prompt + lot JSON)
-  6) Fuzzy matching entreprise
-  7) save_trip pour chaque reçu valide
-  8) Message WhatsApp final récapitulatif
+  4) Découpage en lots de LOT_SIZE
+  5) Lots → OpenAI en série
+     → le LLM gère aussi le fuzzy matching entreprise dans le prompt
+  6) save_trip pour chaque reçu valide
+  7) Message WhatsApp final récapitulatif
 
 PIPELINE MODE TEXTE :
   1) Chargement mémoire Redis (résumé + 10 derniers msgs)
@@ -24,7 +27,6 @@ PIPELINE MODE TEXTE :
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import logging
@@ -32,7 +34,6 @@ import os
 import re
 import time
 from datetime import date
-from difflib import get_close_matches, SequenceMatcher
 from typing import Any, Optional
 
 import httpx
@@ -75,16 +76,8 @@ app = FastAPI()
 _OPENAI_API_KEY: str   = os.getenv("OPENAI_API_KEY", "")
 _LLM_MODEL:      str   = os.getenv("LLM_MODEL", "gpt-4o")
 
-LOT_SIZE:          int   = 5      # reçus par appel OpenAI
-OPENAI_TIMEOUT:    float = 45.0   # secondes par lot
-FUZZY_THRESHOLD:   float = 0.72   # seuil similarité entreprise [0-1]
-
-# Pattern de détection immatriculation (format maghrébin + européen)
-_IMMAT_PATTERN = re.compile(
-    r'\b([A-Z]{1,3}[-\s]?\d{3,5}[-\s]?[A-Z]{0,3}'   # EU style
-    r'|\d{4,6}[-\s]?[A-Z]{1,3}[-\s]?\d{0,2})\b',      # maghrébin
-    re.IGNORECASE,
-)
+LOT_SIZE:        int   = 5     # reçus par appel OpenAI
+OPENAI_TIMEOUT:  float = 45.0  # secondes par lot
 
 # ── LLM & Agent (branche texte) ───────────────────────────────────────────────
 
@@ -98,7 +91,7 @@ _tools = [
 _memory = MemorySaver()
 graph   = create_react_agent(llm, _tools, checkpointer=_memory)
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
+# ── Prompt système agent texte ────────────────────────────────────────────────
 
 _BASE_SYSTEM = f"""Tu es un assistant de gestion de transport de marchandises.
 La date du jour est : {date.today().strftime('%d/%m/%Y')}.
@@ -125,23 +118,63 @@ PDF :
 - Sois concis, utilise les emojis WhatsApp
 """
 
-_EXTRACT_SYSTEM = """Tu es un extracteur de données de reçus de transport.
-Tu reçois une liste JSON de reçus OCR. Pour chaque reçu, extrais les données.
+# ── Prompt extraction prix (appelé UNE seule fois avant le pipeline) ──────────
 
+_PRICE_EXTRACT_SYSTEM = """Tu es un extracteur de prix depuis un message WhatsApp.
+L utilisateur envoie un message qui contient deux prix :
+- prix_camion : ce que l on paie au transporteur par tonne
+- prix_client : ce que l entreprise paie par tonne
+
+Le message peut être dans n importe quelle langue et n importe quel format :
+exemples : "5000 7000", "camion 5000 client 7000", "سعر الشاحن 5000 سعر الشركة 7000",
+           "transport=5000 entreprise=7000", "le petit est camion le grand est client"
+
+Règle : le prix_camion est TOUJOURS inférieur au prix_client.
+Si un seul chiffre est fourni ou les deux sont identiques, retourner null pour les deux.
+
+Réponds UNIQUEMENT avec un objet JSON valide, sans markdown :
+{"prix_camion": 5000.0, "prix_client": 7000.0}
+ou si impossible :
+{"prix_camion": null, "prix_client": null}"""
+
+# ── Prompt extraction reçus OCR (avec fuzzy entreprise intégré) ───────────────
+
+def _build_extract_system(known_names: list[str]) -> str:
+    """
+    Prompt d extraction des reçus OCR.
+    Intègre la liste des entreprises connues pour que le LLM fasse
+    lui-même le matching — pas besoin de fuzzy côté code.
+    """
+    entreprises_block = ""
+    if known_names:
+        liste = "\n".join(f"  - {n}" for n in known_names)
+        entreprises_block = f"""
+Entreprises connues dans la base de données :
+{liste}
+
+Règle entreprise : si le nom lu sur le reçu ressemble à l une des entreprises
+connues (faute d orthographe, abréviation, etc.), utiliser le nom exact de la base.
+Exemples : "achemin" → "Achemine", "somine" → "Somine SA", etc.
+Si aucun match raisonnable → retourner le nom tel quel du reçu.
+"""
+
+    return f"""Tu es un extracteur de données de reçus de transport.
+Tu reçois une liste JSON de reçus OCR. Pour chaque reçu, extrais les données.
+{entreprises_block}
 Réponds UNIQUEMENT avec un tableau JSON valide. Format STRICT :
 [
-  {
+  {{
     "id": 0,
     "immatriculation": "valeur ou null",
     "tonnage_kg": 12345.6,
-    "entreprise": "Nom exact du reçu"
-  }
+    "entreprise": "Nom exact de la base ou du reçu"
+  }}
 ]
 
 Règles :
 - Conserver l id de chaque reçu tel quel
 - 🔢 dans le texte signale une immatriculation véhicule
-- tonnage_kg TOUJOURS en kg (ne pas convertir)
+- tonnage_kg TOUJOURS en kg, ne pas convertir
 - Si donnée absente ou illisible → null
 - Ne jamais inventer de données
 - Aucun texte avant ou après le JSON"""
@@ -150,12 +183,14 @@ Règles :
 # ── Schéma payload ────────────────────────────────────────────────────────────
 
 class Payload(BaseModel):
-    message:     Optional[str]       = ""
-    user:        Optional[str]       = ""
-    image:       Optional[str]       = None
-    images:      Optional[list[str]] = None
-    prix_camion: Optional[float]     = None   # OBLIGATOIRE si images
-    prix_client: Optional[float]     = None   # OBLIGATOIRE si images
+    message: Optional[str]       = ""
+    user:    Optional[str]       = ""
+    image:   Optional[str]       = None
+    images:  Optional[list[str]] = None
+    # Les prix peuvent aussi arriver directs depuis un client API avancé
+    # mais le LLM les extrait aussi depuis message — les deux sont supportés
+    prix_camion: Optional[float] = None
+    prix_client: Optional[float] = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -172,72 +207,66 @@ def _decode_images(payload: Payload) -> list[bytes]:
 
 
 def _clean_ocr(text: str) -> str:
-    """
-    Nettoie le texte OCR :
-    - Détecte les immatriculations → préfixe 🔢
-    - Supprime les caractères parasites répétés
-    """
+    """Nettoie le texte OCR et tague les immatriculations avec 🔢."""
     if not text:
-        return text
-
-    # Tagging immatriculation
+        return ""
+    _IMMAT = re.compile(
+        r'\b([A-Z]{1,3}[-\s]?\d{3,5}[-\s]?[A-Z]{0,3}|\d{4,6}[-\s]?[A-Z]{1,3}[-\s]?\d{0,2})\b',
+        re.IGNORECASE,
+    )
     def _tag(m: re.Match) -> str:
-        val = m.group(0).upper().replace(" ", "-")
-        return f"🔢 {val}"
+        return f"🔢 {m.group(0).upper().replace(' ', '-')}"
 
-    text = _IMMAT_PATTERN.sub(_tag, text)
-
-    # Supprime les lignes de moins de 2 caractères (bruit OCR)
+    text  = _IMMAT.sub(_tag, text)
     lines = [l for l in text.splitlines() if len(l.strip()) > 2]
     return "\n".join(lines)
 
 
-def _normalize(name: str) -> str:
-    return name.strip().lower()
-
-
-def _fuzzy_match(raw: str | None, known: list[str]) -> tuple[str | None, float]:
-    if not raw or not known:
-        return None, 0.0
-    norm_map = {_normalize(n): n for n in known}
-    matches  = get_close_matches(_normalize(raw), norm_map.keys(), n=1, cutoff=FUZZY_THRESHOLD)
-    if matches:
-        original = norm_map[matches[0]]
-        score    = SequenceMatcher(None, _normalize(raw), matches[0]).ratio()
-        return original, score
-    return None, 0.0
-
-
-def _validate_prices(payload: Payload) -> str | None:
+def _llm_extract_prices(message: str) -> dict:
     """
-    Retourne un message d erreur si les prix sont manquants, None si OK.
+    Appelle OpenAI pour extraire prix_camion et prix_client
+    depuis le message texte de l utilisateur.
+    Retourne {"prix_camion": float|None, "prix_client": float|None}.
     """
-    missing: list[str] = []
-    if payload.prix_camion is None:
-        missing.append("💰 *prix_camion* (prix payé au transporteur par tonne)")
-    if payload.prix_client is None:
-        missing.append("💵 *prix_client* (prix facturé à l'entreprise par tonne)")
-    if missing:
-        return (
-            "⚠️ *Prix manquants — traitement annulé.*\n\n"
-            "Merci de fournir :\n" +
-            "\n".join(f"  • {m}" for m in missing) +
-            "\n\nRenvoyez vos images avec ces deux prix."
-        )
-    return None
+    if not message or not message.strip():
+        return {"prix_camion": None, "prix_client": None}
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {_OPENAI_API_KEY}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":       _LLM_MODEL,
+                    "temperature": 0,
+                    "max_tokens":  60,
+                    "messages": [
+                        {"role": "system", "content": _PRICE_EXTRACT_SYSTEM},
+                        {"role": "user",   "content": message},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            raw  = resp.json()["choices"][0]["message"]["content"].strip()
+            clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+            data  = json.loads(clean)
+            logger.info("💲 Prix extraits par LLM : %s", data)
+            return data
+    except Exception as exc:
+        logger.error("Erreur extraction prix LLM : %s", exc)
+        return {"prix_camion": None, "prix_client": None}
 
 
-# ── Appel OpenAI pour un lot ──────────────────────────────────────────────────
-
-def _call_openai_lot(lot: list[dict], lot_num: int) -> list[dict]:
+def _call_openai_lot(lot: list[dict], lot_num: int, extract_system: str) -> list[dict]:
     """
     Envoie un lot de reçus OCR à OpenAI et retourne la liste extraite.
-    Appelé en série, un lot après l'autre.
+    Appelé en série, un lot après l autre.
     """
     logger.info("🤖 Lot #%d → OpenAI (%d reçus)", lot_num, len(lot))
-    t0 = time.perf_counter()
-
-    user_content = json.dumps(lot, ensure_ascii=False, indent=2)
+    t0           = time.perf_counter()
     raw_response = ""
 
     try:
@@ -253,35 +282,30 @@ def _call_openai_lot(lot: list[dict], lot_num: int) -> list[dict]:
                     "temperature": 0,
                     "max_tokens":  600,
                     "messages": [
-                        {"role": "system", "content": _EXTRACT_SYSTEM},
-                        {"role": "user",   "content": user_content},
+                        {"role": "system", "content": extract_system},
+                        {"role": "user",   "content": json.dumps(lot, ensure_ascii=False, indent=2)},
                     ],
                 },
             )
             resp.raise_for_status()
             raw_response = resp.json()["choices"][0]["message"]["content"].strip()
 
-        # Nettoyage éventuel de backticks markdown
         clean = re.sub(r"```(?:json)?|```", "", raw_response).strip()
         data  = json.loads(clean)
 
         if not isinstance(data, list):
-            raise ValueError(f"Réponse OpenAI non-liste : {type(data)}")
+            raise ValueError(f"Réponse non-liste : {type(data)}")
 
-        logger.info("✅ Lot #%d traité en %.2fs", lot_num, time.perf_counter() - t0)
+        logger.info("✅ Lot #%d — %.2fs", lot_num, time.perf_counter() - t0)
         return data
 
     except json.JSONDecodeError as exc:
         logger.error("❌ Lot #%d JSON invalide : %s | brut=%r", lot_num, exc, raw_response)
-        # Retourne des entrées en erreur pour chaque reçu du lot
         return [{"id": r["id"], "erreur": f"JSON invalide : {exc}"} for r in lot]
-
     except Exception as exc:
-        logger.error("❌ Lot #%d erreur OpenAI : %s", lot_num, exc)
+        logger.error("❌ Lot #%d erreur : %s", lot_num, exc)
         return [{"id": r["id"], "erreur": str(exc)} for r in lot]
 
-
-# ── Construction récap WhatsApp ───────────────────────────────────────────────
 
 def _build_recap(
     results:     list[dict],
@@ -305,14 +329,10 @@ def _build_recap(
             kg     = r.get("tonnage_kg")
             tonnes = f"{kg / 1000:.3f} t  ({kg:,.0f} kg)" if kg else "—"
             ent    = r.get("entreprise") or "—"
-            corr   = (
-                f"\n   _(corrigé depuis « {r['entreprise_brute']} »)_"
-                if r.get("fuzzy_corrige") else ""
-            )
             lines.append(f"📋 *Reçu #{num}*")
             lines.append(f"   🚛 Immat      : `{immat}`")
             lines.append(f"   ⚖️  Tonnage    : {tonnes}")
-            lines.append(f"   🏢 Entreprise : {ent}{corr}")
+            lines.append(f"   🏢 Entreprise : {ent}")
         else:
             err = r.get("erreur") or "Données manquantes"
             lines.append(f"❌ *Reçu #{num}* — non enregistré")
@@ -330,10 +350,8 @@ def _build_recap(
 @app.post("/agent")
 async def agent_endpoint(payload: Payload):
     user_id = payload.user or "default"
-    logger.info("📩 [%s] images=%d  msg=%r",
-                user_id,
-                len(payload.images or ([payload.image] if payload.image else [])),
-                payload.message)
+    nb_imgs = len(payload.images or ([payload.image] if payload.image else []))
+    logger.info("📩 [%s] images=%d  msg=%r", user_id, nb_imgs, payload.message)
 
     try:
         images_bytes = _decode_images(payload)
@@ -344,46 +362,66 @@ async def agent_endpoint(payload: Payload):
         if images_bytes:
             nb = len(images_bytes)
 
-            # ── 0) Validation prix — AVANT TOUT ──────────────────────────────
-            price_error = _validate_prices(payload)
-            if price_error:
-                logger.warning("[%s] Prix manquants — traitement annulé", user_id)
-                return {"reply": price_error}
+            # ── 0) Extraction prix par LLM — UNE seule fois ───────────────────
+            # Priorité : valeurs JSON explicites > extraction depuis message
+            prix_camion = payload.prix_camion
+            prix_client = payload.prix_client
 
-            # ── 1) ACK immédiat WhatsApp ──────────────────────────────────────
-            # Note : en production, envoyer ce message via l API WhatsApp
-            # avant de continuer le traitement (webhook async).
+            if prix_camion is None or prix_client is None:
+                extracted_prices = _llm_extract_prices(payload.message or "")
+                prix_camion = prix_camion or extracted_prices.get("prix_camion")
+                prix_client = prix_client or extracted_prices.get("prix_client")
+
+            # Si encore manquant → demander UNE SEULE FOIS (indépendant du nb d images)
+            missing = []
+            if prix_camion is None:
+                missing.append("💰 *prix camion* (payé au transporteur par tonne)")
+            if prix_client is None:
+                missing.append("💵 *prix client* (facturé à l'entreprise par tonne)")
+
+            if missing:
+                logger.warning("[%s] Prix manquants après extraction LLM", user_id)
+                return {
+                    "reply": (
+                        "⚠️ *Prix manquants — merci de préciser :*\n\n" +
+                        "\n".join(f"  • {m}" for m in missing) +
+                        "\n\nExemple : _5000 7000_ ou _camion 5000 client 7000_\n"
+                        "Renvoyez vos images avec ces prix."
+                    )
+                }
+
+            logger.info("💲 [%s] prix_camion=%.0f  prix_client=%.0f", user_id, prix_camion, prix_client)
+
+            # ── 1) ACK immédiat ───────────────────────────────────────────────
             ack_message = (
                 f"⏳ *Traitement en cours...*\n"
                 f"📄 {nb} reçu(s) reçu(s)\n"
-                f"💰 Prix camion : {payload.prix_camion} /t\n"
-                f"💵 Prix client : {payload.prix_client} /t\n"
+                f"💰 Prix camion : {prix_camion} /t\n"
+                f"💵 Prix client : {prix_client} /t\n"
                 f"Merci de patienter ✨"
             )
-            logger.info("📤 ACK → [%s] : %s", user_id, ack_message)
+            logger.info("📤 ACK → [%s]", user_id)
 
-            # ── 2) OCR multithreading (hors LLM) ─────────────────────────────
-            logger.info("🖼️  Lancement OCR sur %d image(s)...", nb)
+            # ── 2) OCR multithreading ─────────────────────────────────────────
+            logger.info("🖼️  OCR sur %d image(s)...", nb)
             ocr_results = extract_text_from_images(images_bytes)
 
-            # ── 3) Nettoyage OCR + construction liste JSON ────────────────────
-            ocr_list: list[dict] = []
+            # ── 3) Nettoyage OCR ──────────────────────────────────────────────
+            ocr_list:   list[dict] = []
+            failed_ocr: dict[int, str] = {}
+
             for idx in sorted(ocr_results):
-                entry  = ocr_results[idx]
+                entry = ocr_results[idx]
                 if entry["error"]:
                     logger.warning("⚠️  Image #%d OCR échoué : %s", idx + 1, entry["error"])
-                    ocr_list.append({
-                        "id":       idx,
-                        "ocr_text": None,
-                        "_ocr_err": entry["error"],
-                    })
+                    failed_ocr[idx] = entry["error"]
                 else:
                     ocr_list.append({
                         "id":       idx,
                         "ocr_text": _clean_ocr(entry["text"] or ""),
                     })
 
-            # ── 4) Entreprises connues pour fuzzy ─────────────────────────────
+            # ── 4) Entreprises connues → données au LLM pour fuzzy ────────────
             try:
                 known_raw   = list_entreprises.invoke({})
                 known_names: list[str] = (
@@ -394,50 +432,33 @@ async def agent_endpoint(payload: Payload):
                 logger.warning("list_entreprises indisponible : %s", exc)
                 known_names = []
 
-            # ── 5) Découpage en lots de LOT_SIZE ─────────────────────────────
-            # On exclut les reçus en erreur OCR du traitement OpenAI
-            valid_ocr  = [r for r in ocr_list if r.get("ocr_text")]
-            failed_ocr = {r["id"]: r["_ocr_err"] for r in ocr_list if not r.get("ocr_text")}
+            # Prompt extraction avec liste entreprises intégrée
+            extract_system = _build_extract_system(known_names)
 
-            lots = [
-                valid_ocr[i: i + LOT_SIZE]
-                for i in range(0, len(valid_ocr), LOT_SIZE)
-            ]
+            # ── 5) Lots de LOT_SIZE → OpenAI en série ─────────────────────────
+            lots = [ocr_list[i: i + LOT_SIZE] for i in range(0, len(ocr_list), LOT_SIZE)]
+            logger.info("📦 %d reçu(s) → %d lot(s)", len(ocr_list), len(lots))
 
-            logger.info(
-                "📦 %d reçu(s) valides → %d lot(s) de max %d",
-                len(valid_ocr), len(lots), LOT_SIZE,
-            )
-
-            # ── 6) Appels OpenAI en SÉRIE (lot par lot) ───────────────────────
             all_extracted: list[dict] = []
             for lot_num, lot in enumerate(lots, start=1):
-                # Envoi uniquement des champs utiles à OpenAI
-                lot_payload = [{"id": r["id"], "ocr_text": r["ocr_text"]} for r in lot]
-                extracted   = _call_openai_lot(lot_payload, lot_num)
+                extracted = _call_openai_lot(lot, lot_num, extract_system)
                 all_extracted.extend(extracted)
 
-            # ── 7) Fuzzy matching + save_trip ─────────────────────────────────
+            # ── 6) save_trip pour chaque reçu valide ──────────────────────────
             results_map: dict[int, dict] = {}
 
-            # Initialiser avec les erreurs OCR
+            # Erreurs OCR
             for idx, err in failed_ocr.items():
-                results_map[idx] = {
-                    "id":     idx,
-                    "saved":  False,
-                    "erreur": f"OCR échoué : {err}",
-                }
+                results_map[idx] = {"id": idx, "saved": False, "erreur": f"OCR échoué : {err}"}
 
             for item in all_extracted:
-                idx = item.get("id", -1)
+                idx   = item.get("id", -1)
                 entry: dict[str, Any] = {
                     "id":              idx,
                     "saved":           False,
-                    "fuzzy_corrige":   False,
                     "immatriculation": None,
                     "tonnage_kg":      None,
                     "entreprise":      None,
-                    "entreprise_brute": None,
                     "erreur":          item.get("erreur"),
                 }
 
@@ -447,72 +468,49 @@ async def agent_endpoint(payload: Payload):
 
                 immat      = item.get("immatriculation")
                 tonnage_kg = item.get("tonnage_kg")
-                ent_brute  = item.get("entreprise")
+                entreprise = item.get("entreprise")
 
-                entry["immatriculation"]   = immat
-                entry["tonnage_kg"]        = tonnage_kg
-                entry["entreprise_brute"]  = ent_brute
+                entry["immatriculation"] = immat
+                entry["tonnage_kg"]      = tonnage_kg
+                entry["entreprise"]      = entreprise
 
-                # Fuzzy matching
-                ent_corrige, score = _fuzzy_match(ent_brute, known_names)
-                if ent_corrige and _normalize(ent_corrige) != _normalize(ent_brute or ""):
-                    entry["entreprise"]    = ent_corrige
-                    entry["fuzzy_corrige"] = True
-                    logger.info("🔧 Reçu #%d  '%s' → '%s' (%.0f%%)",
-                                idx + 1, ent_brute, ent_corrige, score * 100)
-                else:
-                    entry["entreprise"] = ent_corrige or ent_brute
-                    if not ent_corrige and ent_brute and known_names:
-                        logger.warning("⚠️  Reçu #%d '%s' : aucun match fuzzy", idx + 1, ent_brute)
-
-                # Validation
                 if not tonnage_kg:
                     entry["erreur"] = "Tonnage introuvable"
                     results_map[idx] = entry
                     continue
-                if not entry["entreprise"]:
+                if not entreprise:
                     entry["erreur"] = "Entreprise introuvable"
                     results_map[idx] = entry
                     continue
 
-                # Enregistrement
                 try:
                     save_kwargs: dict[str, Any] = {
-                        "entreprise":  entry["entreprise"],
+                        "entreprise":  entreprise,
                         "tonnage":     tonnage_kg,
                         "unite":       "kg",
-                        "prix_camion": payload.prix_camion,
-                        "prix_client": payload.prix_client,
+                        "prix_camion": prix_camion,
+                        "prix_client": prix_client,
                     }
                     if immat:
                         save_kwargs["camion"] = immat
 
                     save_trip.invoke(save_kwargs)
                     entry["saved"] = True
-                    logger.info(
-                        "💾 Reçu #%d enregistré — %s / %s / %.0f kg",
-                        idx + 1, immat, entry["entreprise"], tonnage_kg,
-                    )
+                    logger.info("💾 #%d — %s / %s / %.0f kg", idx + 1, immat, entreprise, tonnage_kg)
+
                 except Exception as exc:
                     entry["erreur"] = f"Erreur save_trip : {exc}"
                     logger.error("❌ Reçu #%d save_trip : %s", idx + 1, exc)
 
                 results_map[idx] = entry
 
-            # ── 8) Message final récapitulatif ────────────────────────────────
+            # ── 7) Récap final ─────────────────────────────────────────────────
             all_results = list(results_map.values())
-            recap = _build_recap(
-                all_results,
-                nb_total    = nb,
-                prix_camion = payload.prix_camion,
-                prix_client = payload.prix_client,
-            )
-            logger.info("📤 Récap final :\n%s", recap)
+            recap = _build_recap(all_results, nb_total=nb,
+                                 prix_camion=prix_camion, prix_client=prix_client)
+            logger.info("📤 Récap :\n%s", recap)
 
-            return {
-                "ack":   ack_message,   # à envoyer immédiatement via webhook
-                "reply": recap,         # réponse finale
-            }
+            return {"ack": ack_message, "reply": recap}
 
         # ══════════════════════════════════════════════════════════════════════
         # BRANCHE TEXTE — LangGraph + mémoire Redis
@@ -520,33 +518,27 @@ async def agent_endpoint(payload: Payload):
         else:
             user_msg = payload.message or ""
 
-            # Chargement mémoire Redis
             summary, history = load_context(user_id)
             memory_block     = build_memory_prompt(summary, history)
 
-            # Prompt système enrichi avec la mémoire
             system_content = _BASE_SYSTEM
             if memory_block:
                 system_content += f"\n\n{memory_block}"
 
             config = {"configurable": {"thread_id": user_id}}
             result = graph.invoke(
-                {
-                    "messages": [
-                        SystemMessage(content=system_content),
-                        HumanMessage(content=user_msg),
-                    ]
-                },
+                {"messages": [
+                    SystemMessage(content=system_content),
+                    HumanMessage(content=user_msg),
+                ]},
                 config=config,
             )
 
             reply = result["messages"][-1].content
             logger.info("📤 BOT [%s]: %s", user_id, reply)
 
-            # Sauvegarde échange dans Redis
             save_exchange(user_id, user_msg, reply)
 
-            # Détection PDF_READY
             if "PDF_READY:" in reply:
                 pdf_path = reply.split("PDF_READY:")[-1].strip().split("\n")[0].strip()
                 return {
@@ -567,17 +559,15 @@ async def agent_endpoint(payload: Payload):
 @app.get("/health")
 async def health():
     return {
-        "status":          "ok",
-        "model":           _LLM_MODEL,
-        "lot_size":        LOT_SIZE,
-        "openai_timeout":  OPENAI_TIMEOUT,
-        "fuzzy_threshold": FUZZY_THRESHOLD,
+        "status":         "ok",
+        "model":          _LLM_MODEL,
+        "lot_size":       LOT_SIZE,
+        "openai_timeout": OPENAI_TIMEOUT,
     }
 
 
 @app.delete("/memory/{user_id}")
 async def reset_memory(user_id: str):
-    """Efface la mémoire conversationnelle d'un utilisateur."""
     from memory_service import clear_memory
     clear_memory(user_id)
     return {"status": "ok", "message": f"Mémoire effacée pour {user_id}"}
