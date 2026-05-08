@@ -834,7 +834,7 @@ async def poll_reply(user_id: str):
     except Exception as exc:
         logger.error("Poll Redis erreur [%s]: %s", user_id, exc)
         return {"reply": None, "user": user_id}
-
+ 
 
 # ── Endpoints utilitaires ─────────────────────────────────────────────────────
 
