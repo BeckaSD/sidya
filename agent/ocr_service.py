@@ -1,5 +1,5 @@
 """
-ocr_service.py
+ocr_service.py ff
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Service OCR autonome — indépendant du LLM.
 
